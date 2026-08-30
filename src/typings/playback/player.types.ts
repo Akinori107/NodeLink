@@ -188,11 +188,22 @@ export interface ExtendedAudioStream extends AudioResource {
     options: CrossfadePrepareOptions,
     onComplete: (consumedMs: number) => void
   ): boolean
+  detachCrossfadeStream?(): {
+    target: unknown
+    options: CrossfadePrepareOptions
+  } | null
+  adoptCrossfadeStream?(
+    target: unknown,
+    options: CrossfadePrepareOptions,
+    onComplete: (consumedMs: number) => void
+  ): boolean
   startCrossfade?(
     durationMs?: number,
     curve?: string,
-    availableMs?: number
+    availableMs?: number,
+    outroRemainingMs?: number
   ): boolean
+  resetCrossfadePlan?(): boolean
   clearCrossfade?(): void
   setCrossfadePaused?(paused: boolean): void
   getCrossfadeState?(): {

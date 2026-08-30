@@ -50,6 +50,7 @@ import type {
   SymphoniaDecoderStreamOptions
 } from '../../typings/playback/streamProcessor.types.ts'
 import { http1makeRequest, logger } from '../../utils.ts'
+import type { WebmTimingInfo } from '../../typings/playback/demuxer.types.ts'
 import FlvDemuxer from '../demuxers/Flv.ts'
 import WebmOpusDemuxer from '../demuxers/WebmOpus.ts'
 import { Decoder as OpusDecoder, Encoder as OpusEncoder } from '../opus/Opus.ts'
@@ -851,15 +852,51 @@ class BaseAudioResource {
     return controller?.prepareNextStream(stream, options, onComplete) ?? false
   }
 
-  startCrossfade(
-    durationMs?: number,
-    curve?: string,
-    availableMs?: number
+  detachCrossfadeStream(): {
+    target: unknown
+    options: CrossfadePrepareOptions
+  } | null {
+    const controller = this.pipes?.find(
+      (pipe) => pipe instanceof CrossfadeController
+    ) as CrossfadeController | undefined
+    return controller?.detachNextStream() ?? null
+  }
+
+  adoptCrossfadeStream(
+    target: unknown,
+    options: CrossfadePrepareOptions,
+    onComplete: (consumedMs: number) => void
   ): boolean {
     const controller = this.pipes?.find(
       (pipe) => pipe instanceof CrossfadeController
     ) as CrossfadeController | undefined
-    return controller?.startCrossfade(durationMs, curve, availableMs) ?? false
+    return controller?.adoptNextStream(target, options, onComplete) ?? false
+  }
+
+  startCrossfade(
+    durationMs?: number,
+    curve?: string,
+    availableMs?: number,
+    outroRemainingMs?: number
+  ): boolean {
+    const controller = this.pipes?.find(
+      (pipe) => pipe instanceof CrossfadeController
+    ) as CrossfadeController | undefined
+    return (
+      controller?.startCrossfade(
+        durationMs,
+        curve,
+        availableMs,
+        outroRemainingMs
+      ) ?? false
+    )
+  }
+
+  resetCrossfadePlan(): boolean {
+    const controller = this.pipes?.find(
+      (pipe) => pipe instanceof CrossfadeController
+    ) as CrossfadeController | undefined
+    return controller?.resetCrossfadePlan() ?? false
   }
 
   clearCrossfade(): void {
@@ -1452,6 +1489,8 @@ class AACDecoderStream extends Transform {
   private ringBuffer: RingBufferLike
   private resamplingQuality: string
   private resamplerCreationPromise: Promise<ResamplerLike> | null
+  private frameDecodeWarned = false
+  private flushDecodeWarned = false
   private static readonly MAX_PENDING_CHUNKS = 200
 
   private state: { isAlac: boolean } | null
@@ -1732,7 +1771,16 @@ class AACDecoderStream extends Transform {
               this.push(Buffer.from(pcmInt16.buffer))
             }
           }
-        } catch (_decodeErr) {}
+        } catch (decodeError) {
+          if (!this.frameDecodeWarned) {
+            this.frameDecodeWarned = true
+            logger(
+              'warn',
+              'AAC',
+              `Frame decode failed: ${(decodeError as Error).message}`
+            )
+          }
+        }
 
         this.ringBuffer.skip(frameInfo.end)
       }
@@ -1763,7 +1811,16 @@ class AACDecoderStream extends Transform {
             this.push(Buffer.from(pcmInt16.buffer))
           }
         }
-      } catch (_err) {}
+      } catch (decodeError) {
+        if (!this.flushDecodeWarned) {
+          this.flushDecodeWarned = true
+          logger(
+            'warn',
+            'AAC',
+            `Flush decode failed: ${(decodeError as Error).message}`
+          )
+        }
+      }
     }
 
     this.cleanup()
@@ -2202,6 +2259,7 @@ class FMP4ToAACStream extends Transform {
   private bufferMode: boolean
   private buffer: Buffer
   private _streamState: FMP4StreamState | null
+  private flushProcessWarned = false
 
   constructor(options: FMP4StreamOptions = {}) {
     super(options as TransformOptions)
@@ -2638,7 +2696,16 @@ class FMP4ToAACStream extends Transform {
     if (this.bufferMode) {
       try {
         this._processBuffer()
-      } catch (_err) {}
+      } catch (processError) {
+        if (!this.flushProcessWarned) {
+          this.flushProcessWarned = true
+          logger(
+            'warn',
+            'FMP4',
+            `Buffer processing failed on flush: ${(processError as Error).message}`
+          )
+        }
+      }
     }
     this.buffer = EMPTY_BUFFER
     this._streamState = null
@@ -2733,6 +2800,7 @@ class FLVToAACStream extends Transform {
 class StreamAudioResource extends BaseAudioResource {
   private nodelink: NodeLink
   private frameCounter: PCMFrameCounter | null = null
+  webmTiming: WebmTimingInfo | null = null
 
   constructor(
     guildId: string,
@@ -2936,6 +3004,10 @@ class StreamAudioResource extends BaseAudioResource {
       const demuxer = new WebmOpusDemuxer()
       streams.push(demuxer)
       this.pipes?.push(demuxer)
+      demuxer.once('timing', (timing: WebmTimingInfo) => {
+        this.webmTiming = timing
+        this.stream?.emit('webm-timing', timing)
+      })
     }
 
     streams.push(decoder)

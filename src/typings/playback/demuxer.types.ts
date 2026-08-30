@@ -57,6 +57,11 @@ export interface FlvTagInfo {
   size: number
 }
 
+export interface WebmTimingInfo {
+  firstClusterMs: number | null
+  durationMs: number | null
+}
+
 /**
  * Surface for WebM demuxer streams that emit Opus packets.
  * @public
@@ -66,6 +71,8 @@ export interface WebmOpusDemuxerLike extends Transform {
    * Emitted when the Opus head packet is parsed.
    */
   on(event: 'head', listener: (header: Buffer) => void): this
+
+  on(event: 'timing', listener: (timing: WebmTimingInfo) => void): this
 
   /**
    * Emitted for each decoded Opus packet.

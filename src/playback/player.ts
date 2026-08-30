@@ -8,6 +8,7 @@ import discordVoice, {
   type VoicePlayerState
 } from '@performanc/voice'
 import { EndReasons, GatewayEvents } from '../constants.ts'
+import type { WebmTimingInfo } from '../typings/playback/demuxer.types.ts'
 import type { DuckingConfig } from '../typings/playback/ducking.types.ts'
 import type {
   AudioMixer,
@@ -16,6 +17,7 @@ import type {
   CreateAudioResource,
   CreateSeekeableAudioResource,
   CrossfadeConfig,
+  CrossfadePrepareOptions,
   ExtendedAudioStream,
   ExtendedVoiceConnection,
   FadeTimers,
@@ -43,6 +45,7 @@ import type { TrackUrlResult } from '../typings/sources/source.types.ts'
 import { logger } from '../utils.ts'
 import { AutoMixRegistry } from './processing/AutoMixRegistry.ts'
 import { DuckingController } from './processing/DuckingController.ts'
+import { TransitionProfileCache } from './processing/MusicalAnalyzer.ts'
 
 export type GatewayEventName =
   (typeof GatewayEvents)[keyof typeof GatewayEvents]
@@ -53,6 +56,9 @@ let createSeekeableAudioResource: CreateSeekeableAudioResource | null = null
 const trackFinishMemoryTraceEnabled =
   process.env.NODELINK_TRACK_FINISH_MEMORY_TRACE?.toLowerCase() === 'true'
 const SEEK_CROSSFADE_SAFETY_MS = 15000
+const SEEK_PREPARE_DEFER_DELAY_MS = 1500
+const SEEK_PREPARE_MIN_LEAD_MS = 3000
+const SEEK_PRIME_WAIT_MS = 350
 const MIN_CROSSFADE_SELECTION_MS = 6000
 const MAX_CROSSFADE_SELECTION_MS = 21000
 
@@ -102,8 +108,16 @@ export class Player {
   private _crossfadeToken = 0
   private _crossfadeTimer: NodeJS.Timeout | null = null
   private _crossfadePrepareTimer: NodeJS.Timeout | null = null
+  private _crossfadePrepareInFlightToken: number | null = null
   private _crossfadeCurrentResource: AudioResource | null = null
   private _crossfadePreparationSafetyMs = 0
+  private _preloadUpgradeInFlight = false
+  private _pendingCrossfadeAdoption: {
+    target: unknown
+    options: CrossfadePrepareOptions
+    resource: AudioResource
+    streamInfo: StreamInfo | null
+  } | null = null
   private _audioConsumedBaselineMs = 0
   private _audioTrackBasePositionMs = 0
 
@@ -142,6 +156,8 @@ export class Player {
   private _ignoreIdleStoppedUntil = 0
   private _lyricsBasePosition = 0
   private _lyricsBasePackets = 0
+  private _containerDurationMs: number | null = null
+  private _webmTimingEpoch = 0
   private _lyricsMarkerTimer: NodeJS.Timeout | null = null
   private _audioMixerInitPromise: Promise<void> | null = null
 
@@ -651,6 +667,7 @@ export class Player {
 
         const nextTrack = this.nextTrack
         const nextStreamInfo = this.nextStreamInfo
+        const previousIdentifier = this.track.info.identifier
 
         this._emitTrackEnd(EndReasons.GAPLESS)
 
@@ -676,6 +693,13 @@ export class Player {
           } catch {}
         }
         this._currentResource = resource
+        this._subscribeWebmTiming(resource, 0)
+
+        logger(
+          'info',
+          'Player',
+          `Gapless promoted ${nextTrack.info.identifier} after ${previousIdentifier} for guild ${this.guildId}`
+        )
 
         if (this.duckingController && this.connection && resource.fadeTo) {
           this.duckingController.attach(this.connection)
@@ -1163,6 +1187,88 @@ export class Player {
     if (!this.connection?.audioStream) return
     this._lyricsBasePosition = this._realPosition()
     this._lyricsBasePackets = this.connection.statistics?.packetsExpected ?? 0
+  }
+
+  private _subscribeWebmTiming(
+    resource: unknown,
+    requestedPositionMs: number
+  ): void {
+    this._containerDurationMs = null
+    this._webmTimingEpoch += 1
+    const epoch = this._webmTimingEpoch
+    const carrier = resource as
+      | {
+          webmTiming?: WebmTimingInfo | null
+          stream?: {
+            once?: (
+              event: string,
+              listener: (timing: WebmTimingInfo) => void
+            ) => unknown
+          } | null
+        }
+      | null
+      | undefined
+    if (!carrier) return
+
+    const apply = (timing: WebmTimingInfo): void => {
+      if (epoch !== this._webmTimingEpoch) return
+      this._applyWebmTiming(timing, requestedPositionMs)
+    }
+
+    if (carrier.webmTiming) {
+      apply(carrier.webmTiming)
+      return
+    }
+    carrier.stream?.once?.('webm-timing', apply)
+  }
+
+  private _applyWebmTiming(
+    timing: WebmTimingInfo,
+    requestedPositionMs: number
+  ): void {
+    const metadataLength = this.track?.info?.length ?? 0
+    const durationMs = timing.durationMs
+    if (
+      durationMs !== null &&
+      Number.isFinite(durationMs) &&
+      durationMs > 1000 &&
+      (metadataLength <= 0 || durationMs <= metadataLength + 5000)
+    ) {
+      this._containerDurationMs = durationMs
+    }
+
+    const landedMs = timing.firstClusterMs
+    if (
+      landedMs !== null &&
+      Number.isFinite(landedMs) &&
+      landedMs >= 0 &&
+      Number.isFinite(requestedPositionMs) &&
+      Math.abs(landedMs - requestedPositionMs) >= 250
+    ) {
+      this.position = landedMs
+      this._lyricsBasePosition = landedMs
+      this._lyricsBasePackets =
+        this.connection?.statistics?.packetsExpected ?? this._lyricsBasePackets
+      logger(
+        'info',
+        'Crossfade',
+        `[SeekSync] stream landed at ${Math.round(landedMs)}ms (requested ${Math.round(requestedPositionMs)}ms) — corrected position by ${Math.round(landedMs - requestedPositionMs)}ms for guild ${this.guildId}`
+      )
+    }
+  }
+
+  private _outroAnalysisSupported(
+    urlData: { protocol?: string } | null | undefined
+  ): boolean {
+    const supported = urlData?.protocol === 'sabr'
+    if (!supported) {
+      logger(
+        'debug',
+        'Crossfade',
+        `Skipping outro pre-analysis for guild ${this.guildId} (protocol ${urlData?.protocol ?? 'http'} cannot honor the requested window start)`
+      )
+    }
+    return supported
   }
 
   /**
@@ -1798,6 +1904,7 @@ export class Player {
 
     this._lyricsBasePosition = position
     this._lyricsBasePackets = this.connection?.statistics?.packetsExpected ?? 0
+    this._subscribeWebmTiming(resource, position)
 
     return true
   }
@@ -1852,6 +1959,34 @@ export class Player {
 
     if (this.nextTrack && this.nextResourceIsCrossfade) {
       this._scheduleCrossfadePreparation(startTime || 0)
+    } else if (
+      !this.destroying &&
+      this.track &&
+      !this.track.info.isStream &&
+      this.nextTrack &&
+      this.nextResource &&
+      !this.nextResourceIsCrossfade &&
+      !this.nextTrack.info.isStream &&
+      this._getCrossfadeConfig() &&
+      this._getAudioStream()?.prepareCrossfade
+    ) {
+      const pendingTrack = this.nextTrack
+      this.nextResource.destroy()
+      this.nextResource = null
+      this.nextTrack = null
+      this.nextStreamInfo = null
+      logger(
+        'info',
+        'Crossfade',
+        `Upgrading preloaded next track ${pendingTrack.info.identifier} to crossfade for guild ${this.guildId} (stream ready)`
+      )
+      this.preload(pendingTrack).catch((error) => {
+        logger(
+          'warn',
+          'Crossfade',
+          `Crossfade upgrade of preloaded track failed for guild ${this.guildId}: ${(error as Error).message}`
+        )
+      })
     }
 
     const crossfadeConfig = this._getCrossfadeConfig()
@@ -1862,7 +1997,8 @@ export class Player {
     if (
       crossfadeConfig &&
       !this.track.info.isStream &&
-      trackDurationMs > 30000
+      trackDurationMs > 30000 &&
+      this._outroAnalysisSupported(urlData)
     ) {
       const currentTrack = this.track
       const currentUrlData = urlData
@@ -2222,25 +2358,56 @@ export class Player {
         this._fading('seek')
         this._fading('trackEndSchedule', { startPosition: this.position })
         if (this.nextResourceIsCrossfade) {
+          this._getAudioStream()?.resetCrossfadePlan?.()
           this._crossfadePreparationSafetyMs = SEEK_CROSSFADE_SAFETY_MS
-          this._rescheduleCrossfade(this.position)
 
           const remainingMs =
             (this.track?.endTime || this.track?.info.length || 0) -
             this.position
-          if (remainingMs <= 40000 && this.track && this.streamInfo) {
-            const currentTrack = this.track
-            const currentStreamInfo = this.streamInfo
-            AutoMixRegistry.getInstance()
-              .requestOutroAnalysis({
-                track: currentTrack,
-                urlData: currentStreamInfo,
-                priority: 'IMMINENT_TRANSITION',
-                triggerSource: `player:${this.guildId}:seekImminent`,
-                fetchResource: (info, uData, windowStartMs, returnPcm) =>
-                  this._fetchResource(info, uData, windowStartMs, returnPcm)
-              })
-              .catch(() => {})
+          const preparationToken = this._crossfadeToken
+          const runPostSeekPreparation = () => {
+            if (
+              this.destroying ||
+              preparationToken !== this._crossfadeToken ||
+              !this.nextResourceIsCrossfade
+            ) {
+              return
+            }
+            this._rescheduleCrossfade(this.position)
+
+            if (
+              remainingMs <= 40000 &&
+              this.track &&
+              this.streamInfo &&
+              this._outroAnalysisSupported(this.streamInfo)
+            ) {
+              const currentTrack = this.track
+              const currentStreamInfo = this.streamInfo
+              AutoMixRegistry.getInstance()
+                .requestOutroAnalysis({
+                  track: currentTrack,
+                  urlData: currentStreamInfo,
+                  priority: 'IMMINENT_TRANSITION',
+                  triggerSource: `player:${this.guildId}:seekImminent`,
+                  fetchResource: (info, uData, windowStartMs, returnPcm) =>
+                    this._fetchResource(info, uData, windowStartMs, returnPcm)
+                })
+                .catch(() => {})
+            }
+          }
+
+          const deferMs = Math.max(
+            0,
+            Math.min(
+              SEEK_PREPARE_DEFER_DELAY_MS,
+              remainingMs - SEEK_PREPARE_MIN_LEAD_MS
+            )
+          )
+          if (deferMs > 0) {
+            const deferTimer = setTimeout(runPostSeekPreparation, deferMs)
+            deferTimer.unref?.()
+          } else {
+            runPostSeekPreparation()
           }
         }
       }
@@ -2349,6 +2516,20 @@ export class Player {
     } catch (error) {
       seekHandoff?.cancelSeekHandoff()
       throw error
+    }
+  }
+
+  private async _waitForSeekPrime(resource: AudioResource): Promise<void> {
+    const stream = resource.stream as unknown as Readable | null | undefined
+    if (!stream || typeof stream.readableLength !== 'number') return
+    const deadline = performance.now() + SEEK_PRIME_WAIT_MS
+    while (
+      performance.now() < deadline &&
+      !stream.destroyed &&
+      stream.readableLength === 0 &&
+      !this.destroying
+    ) {
+      await sleep(25)
     }
   }
 
@@ -2493,6 +2674,25 @@ export class Player {
       this._fading('seekPrepare', { resource })
       resource.setFilters(this.filters)
 
+      await this._waitForSeekPrime(resource)
+
+      if (this.nextResourceIsCrossfade && this.nextTrack && this.nextResource) {
+        const detached =
+          this._getAudioStream()?.detachCrossfadeStream?.() ?? null
+        if (detached) {
+          this._pendingCrossfadeAdoption = {
+            target: detached.target,
+            options: detached.options,
+            resource: this.nextResource,
+            streamInfo: this.nextStreamInfo
+          }
+          logger(
+            'info',
+            'Crossfade',
+            `Preserving preloaded next track ${this.nextTrack.info.identifier} across seek for guild ${this.guildId}`
+          )
+        }
+      }
       this._destroyCrossfadeResources(true)
       this._resetAudioConsumptionBaseline(position)
       const oldStream = this.connection?.play(resource as unknown)
@@ -2513,6 +2713,7 @@ export class Player {
       this._lyricsBasePosition = position
       this._lyricsBasePackets =
         this.connection?.statistics?.packetsExpected ?? 0
+      this._subscribeWebmTiming(resource, position)
 
       return true
     } catch (e) {
@@ -2645,6 +2846,7 @@ export class Player {
 
     this._lyricsBasePosition = position
     this._lyricsBasePackets = this.connection?.statistics?.packetsExpected ?? 0
+    this._subscribeWebmTiming(resource, position)
 
     return true
   }
@@ -2725,6 +2927,23 @@ export class Player {
       return false
     }
 
+    const sameAsCurrentTrack =
+      (!!this.track?.encoded &&
+        !!payload.encoded &&
+        this.track.encoded === payload.encoded) ||
+      (!!this.track?.info?.identifier &&
+        !!payload.info?.identifier &&
+        this.track.info.identifier === payload.info.identifier)
+
+    if (sameAsCurrentTrack) {
+      logger(
+        'warn',
+        'Player',
+        `[Action: preload] Ignoring next track for guild ${this.guildId}: identical to current track (${payload.info.identifier}) — possible client queue desync`
+      )
+      return false
+    }
+
     const sameEncoded =
       !!payload.encoded &&
       !!this.nextTrack?.encoded &&
@@ -2756,6 +2975,7 @@ export class Player {
       this._getAudioStream()?.clearCrossfade?.()
       this._clearCrossfadeTimer()
       this._crossfadeToken += 1
+      this._disposePendingCrossfadeAdoption()
     }
     if (this.nextResource) {
       this.nextResource.destroy()
@@ -2806,6 +3026,38 @@ export class Player {
       this.nextStreamInfo = { ...urlData, trackInfo: payload.info }
       this.nextResourceIsCrossfade = false
 
+      const upgradeConfig = this._getCrossfadeConfig()
+      const upgradeStream = this._getAudioStream()
+      const upgradeLength = this.track?.endTime || this.track?.info.length || 0
+      if (
+        upgradeConfig &&
+        !this.destroying &&
+        !this._preloadUpgradeInFlight &&
+        this.track &&
+        !this.track.info.isStream &&
+        !payload.info.isStream &&
+        Number.isFinite(upgradeLength) &&
+        upgradeLength > 0 &&
+        upgradeStream?.prepareCrossfade
+      ) {
+        const pendingTrack = payload
+        this.nextResource.destroy()
+        this.nextResource = null
+        this.nextTrack = null
+        this.nextStreamInfo = null
+        logger(
+          'info',
+          'Crossfade',
+          `Upgrading preloaded next track ${pendingTrack.info.identifier} to crossfade for guild ${this.guildId}`
+        )
+        this._preloadUpgradeInFlight = true
+        try {
+          return await this.preload(pendingTrack)
+        } finally {
+          this._preloadUpgradeInFlight = false
+        }
+      }
+
       if (this.volumePercent !== 100) {
         this.nextResource.setVolume(this.volumePercent / 100)
       }
@@ -2840,6 +3092,7 @@ export class Player {
       this.nextResource.destroy()
       this.nextResource = null
     }
+    this._disposePendingCrossfadeAdoption()
 
     this.nextTrack = null
     this.nextStreamInfo = null
@@ -2885,6 +3138,7 @@ export class Player {
       ) {
         this._crossfadeToken += 1
         audioStream?.clearCrossfade?.()
+        this._disposePendingCrossfadeAdoption()
         this.nextResource?.destroy()
         this.nextResource = null
         this.nextStreamInfo = null
@@ -3944,12 +4198,21 @@ export class Player {
           : this.track.info.length || 0
       if (!Number.isFinite(total) || total <= 0) return false
 
+      const containerDurationMs = this._containerDurationMs
+      const effectiveTotal =
+        containerDurationMs !== null &&
+        Number.isFinite(containerDurationMs) &&
+        containerDurationMs > 0 &&
+        containerDurationMs < total
+          ? containerDurationMs
+          : total
+
       const startPosition = payload.startPosition || 0
       const playbackSpeed =
         this._getAudioStream()?.getEffectiveRate?.() ??
         this._getTimescaleSpeed()
       const remaining =
-        Math.max(0, total - startPosition) /
+        Math.max(0, effectiveTotal - startPosition) /
         (playbackSpeed > 0 ? playbackSpeed : 1)
       const teSection = this.fading?.trackEnd as FadingSection | undefined
       const hasFade =
@@ -4421,57 +4684,95 @@ export class Player {
       return
     }
 
-    const trackInfo = {
-      ...payload.info,
-      audioTrackId: payload.audioTrackId
-    }
-    logger(
-      'debug',
-      'Crossfade',
-      `Preparing ${payload.info.identifier} for guild ${this.guildId}`
-    )
-    const urlData = await this.nodelink.sources.getTrackUrl(trackInfo)
-    if (urlData.exception || token !== this._crossfadeToken) return
+    if (this._crossfadePrepareInFlightToken === token) return
+    this._crossfadePrepareInFlightToken = token
 
-    const fetched = await this._fetchResource(payload.info, urlData, 0, true)
-    if ('exception' in fetched || token !== this._crossfadeToken) {
-      if (!('exception' in fetched)) fetched.stream.destroy()
-      return
-    }
-    if (!fetched.stream.stream) {
-      fetched.stream.destroy()
-      return
-    }
+    try {
+      const trackInfo = {
+        ...payload.info,
+        audioTrackId: payload.audioTrackId
+      }
 
-    const prepared = audioStream.prepareCrossfade(
-      fetched.stream.stream as unknown as import('node:stream').Readable,
-      {
-        durationMs: config.duration,
-        minBufferMs: config.minBufferMs,
-        bufferMs: Math.min(
-          30000,
-          Math.max(
-            config.bufferMs,
-            Math.min(16000, config.duration * 2 + 4000),
-            this._crossfadePreparationSafetyMs + config.minBufferMs
-          )
+      const adoption = this._pendingCrossfadeAdoption
+      if (adoption && !this.nextResource) {
+        this._pendingCrossfadeAdoption = null
+        const adopted = audioStream.adoptCrossfadeStream?.(
+          adoption.target,
+          adoption.options,
+          (consumedMs) => this._completeCrossfade(token, consumedMs)
         )
-      },
-      (consumedMs) => this._completeCrossfade(token, consumedMs)
-    )
-    if (!prepared || token !== this._crossfadeToken) {
-      fetched.stream.destroy()
-      return
-    }
+        if (adopted) {
+          this.nextResource = adoption.resource
+          this.nextStreamInfo = adoption.streamInfo
+          logger(
+            'info',
+            'Crossfade',
+            `Adopted preloaded ${payload.info.identifier} across pipeline rebuild for guild ${this.guildId} (no re-decode)`
+          )
+          this._scheduleCrossfade()
+          return
+        }
+        try {
+          adoption.resource.destroy()
+        } catch {}
+      }
 
-    this.nextResource = fetched.stream
-    this.nextStreamInfo = { ...urlData, trackInfo: payload.info }
-    logger(
-      'debug',
-      'Crossfade',
-      `Attached ${payload.info.identifier} to the PCM bridge for guild ${this.guildId}`
-    )
-    this._scheduleCrossfade()
+      logger(
+        'debug',
+        'Crossfade',
+        `Preparing ${payload.info.identifier} for guild ${this.guildId}`
+      )
+      const urlData = await this.nodelink.sources.getTrackUrl(trackInfo)
+      if (urlData.exception || token !== this._crossfadeToken) return
+
+      const fetched = await this._fetchResource(payload.info, urlData, 0, true)
+      if ('exception' in fetched || token !== this._crossfadeToken) {
+        if (!('exception' in fetched)) fetched.stream.destroy()
+        return
+      }
+      if (!fetched.stream.stream) {
+        fetched.stream.destroy()
+        return
+      }
+
+      const prepared = audioStream.prepareCrossfade(
+        fetched.stream.stream as unknown as import('node:stream').Readable,
+        {
+          durationMs: config.duration,
+          minBufferMs: config.minBufferMs,
+          bufferMs: Math.min(
+            30000,
+            Math.max(
+              config.bufferMs,
+              Math.min(16000, config.duration * 2 + 4000),
+              this._crossfadePreparationSafetyMs + config.minBufferMs
+            )
+          )
+        },
+        (consumedMs) => this._completeCrossfade(token, consumedMs)
+      )
+      if (!prepared || token !== this._crossfadeToken) {
+        fetched.stream.destroy()
+        return
+      }
+
+      if (this.nextResource) {
+        fetched.stream.destroy()
+        return
+      }
+      this.nextResource = fetched.stream
+      this.nextStreamInfo = { ...urlData, trackInfo: payload.info }
+      logger(
+        'debug',
+        'Crossfade',
+        `Attached ${payload.info.identifier} to the PCM bridge for guild ${this.guildId}`
+      )
+      this._scheduleCrossfade()
+    } finally {
+      if (this._crossfadePrepareInFlightToken === token) {
+        this._crossfadePrepareInFlightToken = null
+      }
+    }
   }
 
   private _scheduleCrossfade(startPosition?: number): boolean {
@@ -4498,15 +4799,35 @@ export class Player {
         : this.track.info.length
     if (!Number.isFinite(total) || total <= 0) return false
 
+    const containerDurationMs = this._containerDurationMs
+    const effectiveTotal =
+      containerDurationMs !== null &&
+      Number.isFinite(containerDurationMs) &&
+      containerDurationMs > 0 &&
+      containerDurationMs < total
+        ? containerDurationMs
+        : total
+    if (effectiveTotal < total) {
+      logger(
+        'debug',
+        'Crossfade',
+        `Clamping fade schedule to container duration ${Math.round(effectiveTotal)}ms (metadata ${Math.round(total)}ms) for guild ${this.guildId}`
+      )
+    }
+
     const position = startPosition ?? this._realPosition()
-    const duration = Math.min(config.duration, Math.max(1, total - position))
+    const duration = Math.min(
+      config.duration,
+      Math.max(1, effectiveTotal - position)
+    )
     const selectionWindow = getCrossfadeSelectionWindowMs(duration)
     const transitionWindow = duration + selectionWindow
     const playbackRate = Math.max(0.01, stream.getEffectiveRate?.() ?? 1)
     const pipelineLead = this._getPipelineLeadMs(stream, position)
     const delay = Math.max(
       0,
-      (total - position - transitionWindow - pipelineLead) / playbackRate
+      (effectiveTotal - position - transitionWindow - pipelineLead) /
+        playbackRate
     )
     const token = this._crossfadeToken
 
@@ -4516,7 +4837,7 @@ export class Player {
       const attemptStart = () => {
         if (token !== this._crossfadeToken || this.isPaused) return
         const currentPosition = this._realPosition()
-        const remaining = Math.max(1, total - currentPosition)
+        const remaining = Math.max(1, effectiveTotal - currentPosition)
         const currentPipelineLead = this._getPipelineLeadMs(
           stream,
           currentPosition
@@ -4531,11 +4852,23 @@ export class Player {
           this._crossfadeTimer.unref?.()
           return
         }
+        const cachedOutroProfile =
+          TransitionProfileCache.get(this.track?.info?.identifier ?? '')
+            ?.outroProfile ?? null
+        const outroRemainingMs =
+          cachedOutroProfile &&
+          (cachedOutroProfile.analysisConfidence ?? 0) >= 0.35
+            ? Math.max(
+                0,
+                effectiveTotal - cachedOutroProfile.energyDecayStartMs
+              )
+            : undefined
         const started =
           stream.startCrossfade?.(
             Math.min(duration, sourceRemaining),
             config.curve,
-            sourceRemaining
+            sourceRemaining,
+            outroRemainingMs
           ) ?? false
         if (started) {
           logger(
@@ -4611,6 +4944,20 @@ export class Player {
     this._lyricsBasePosition = consumedMs
     this._lyricsBasePackets =
       this.connection?.statistics?.packetsExpected ?? this._lyricsBasePackets
+    this._webmTimingEpoch += 1
+    const promotedTiming =
+      (promotedResource as { webmTiming?: WebmTimingInfo | null } | null)
+        ?.webmTiming ?? null
+    const promotedDurationMs = promotedTiming?.durationMs ?? null
+    const promotedMetadataLength = promotedTrack.info.length ?? 0
+    this._containerDurationMs =
+      promotedDurationMs !== null &&
+      Number.isFinite(promotedDurationMs) &&
+      promotedDurationMs > 1000 &&
+      (promotedMetadataLength <= 0 ||
+        promotedDurationMs <= promotedMetadataLength + 5000)
+        ? promotedDurationMs
+        : null
     this._lastPosition = consumedMs
     this.sponsorBlock.segments = []
     this.sponsorBlock.lastSkippedUuid = null
@@ -4636,7 +4983,15 @@ export class Player {
       this._crossfadeCurrentResource.destroy()
       this._crossfadeCurrentResource = null
     }
-    if (this.nextResourceIsCrossfade && this.nextResource) {
+    const adoptionHoldsResource =
+      !!this._pendingCrossfadeAdoption &&
+      this._pendingCrossfadeAdoption.resource === this.nextResource
+    if (!keepQueuedTrack) this._disposePendingCrossfadeAdoption()
+    if (
+      this.nextResourceIsCrossfade &&
+      this.nextResource &&
+      !adoptionHoldsResource
+    ) {
       this.nextResource.destroy()
     }
     if (this.nextResourceIsCrossfade) {
@@ -4645,6 +5000,15 @@ export class Player {
       if (!keepQueuedTrack) this.nextTrack = null
     }
     this.nextResourceIsCrossfade = keepQueuedTrack
+  }
+
+  private _disposePendingCrossfadeAdoption(): void {
+    if (!this._pendingCrossfadeAdoption) return
+    const pending = this._pendingCrossfadeAdoption
+    this._pendingCrossfadeAdoption = null
+    try {
+      pending.resource.destroy()
+    } catch {}
   }
 
   public setCrossfade(config?: CrossfadeConfig): boolean {
@@ -4660,6 +5024,71 @@ export class Player {
       this._fading('trackEndSchedule', { startPosition: this._realPosition() })
     } else if (this.nextResourceIsCrossfade) {
       this._rescheduleCrossfade()
+    } else if (
+      this._getCrossfadeConfig() &&
+      !this.destroying &&
+      this._getAudioStream()?.prepareCrossfade &&
+      this.track &&
+      !this.track.info.isStream &&
+      this.nextTrack &&
+      this.nextResource &&
+      !this.nextResourceIsCrossfade &&
+      !this.nextTrack.info.isStream
+    ) {
+      const pendingTrack = this.nextTrack
+      this.nextResource.destroy()
+      this.nextResource = null
+      this.nextTrack = null
+      this.nextStreamInfo = null
+      logger(
+        'info',
+        'Crossfade',
+        `Upgrading preloaded next track ${pendingTrack.info.identifier} to crossfade for guild ${this.guildId}`
+      )
+      this.preload(pendingTrack).catch((error) => {
+        logger(
+          'warn',
+          'Crossfade',
+          `Crossfade upgrade of preloaded track failed for guild ${this.guildId}: ${(error as Error).message}`
+        )
+      })
+    }
+
+    const enabledConfig = this._getCrossfadeConfig()
+    const outgoingDurationMs =
+      this.track?.endTime && this.track.endTime > 0
+        ? this.track.endTime
+        : this.track?.info.length || 0
+    if (
+      enabledConfig &&
+      this.track &&
+      this.streamInfo &&
+      !this.track.info.isStream &&
+      outgoingDurationMs > 30000 &&
+      this._outroAnalysisSupported(this.streamInfo)
+    ) {
+      const currentTrack = this.track
+      const currentUrlData = this.streamInfo
+      const analysisTimer = setTimeout(() => {
+        if (this.destroying || this.track !== currentTrack) return
+        AutoMixRegistry.getInstance()
+          .requestOutroAnalysis({
+            track: currentTrack,
+            urlData: currentUrlData,
+            priority: 'CURRENT_OUTRO',
+            triggerSource: `player:${this.guildId}:crossfadeEnabled`,
+            fetchResource: (info, uData, windowStartMs, returnPcm) =>
+              this._fetchResource(info, uData, windowStartMs, returnPcm)
+          })
+          .catch((err) => {
+            logger(
+              'debug',
+              'Player',
+              `[AutoMix] Background outro analysis failed for ${currentTrack.info.identifier}: ${(err as Error).message}`
+            )
+          })
+      }, 2500)
+      analysisTimer.unref?.()
     }
     return true
   }

@@ -34,6 +34,8 @@ const FRAME_BYTES =
 const MIN_BPM = 60
 const MAX_BPM = 200
 const HISTORY_FRAMES = 1000
+const MAX_SYNC_ANALYSIS_FRAMES = 50
+const MAX_ANALYSIS_BACKLOG_FRAMES = 400
 
 /**
  * Inferred acoustic genre profile used to guide AutoMix mixing decisions.
@@ -193,6 +195,8 @@ function metricalPrior(bpm: number): number {
  */
 export class MusicalAnalyzer {
   private pending = Buffer.alloc(0)
+  private backlog = Buffer.alloc(0)
+  private analysisDrainScheduled = false
   private readonly onsets: number[] = []
   private readonly lowOnsets: number[] = []
   private previousRms = 0
@@ -257,7 +261,6 @@ export class MusicalAnalyzer {
     })
   }
 
-  /** Adds decoded PCM to the analyzer. */
   public pushPcm(chunk: Buffer): void {
     if (chunk.length === 0) return
 
@@ -267,18 +270,72 @@ export class MusicalAnalyzer {
       this.pending = Buffer.alloc(0)
     }
 
-    let offset = 0
-    while (offset + FRAME_BYTES <= data.length) {
-      this._pushFrame(data.subarray(offset, offset + FRAME_BYTES))
-      offset += FRAME_BYTES
+    const alignedLength = data.length - (data.length % FRAME_BYTES)
+    if (alignedLength > 0) {
+      const aligned = data.subarray(0, alignedLength)
+      this.backlog = this.backlog.length
+        ? Buffer.concat([this.backlog, aligned])
+        : Buffer.from(aligned)
     }
-    if (offset < data.length) this.pending = Buffer.from(data.subarray(offset))
+    if (alignedLength < data.length) {
+      this.pending = Buffer.from(data.subarray(alignedLength))
+    }
+
+    const backlogCapBytes = MAX_ANALYSIS_BACKLOG_FRAMES * FRAME_BYTES
+    if (this.backlog.length > backlogCapBytes) {
+      const excess = this.backlog.length - backlogCapBytes
+      const dropBytes = excess - (excess % FRAME_BYTES)
+      this.backlog = this.backlog.subarray(dropBytes)
+    }
+
+    this._drainAnalysis()
+  }
+
+  public async pushPcmAsync(pcm: Buffer): Promise<void> {
+    const sliceBytes = MAX_SYNC_ANALYSIS_FRAMES * FRAME_BYTES
+    let offset = 0
+    while (offset < pcm.length) {
+      this.pushPcm(
+        pcm.subarray(offset, Math.min(pcm.length, offset + sliceBytes))
+      )
+      offset += sliceBytes
+      await new Promise<void>((resolve) => setImmediate(resolve))
+    }
+    while (this.backlog.length >= FRAME_BYTES) {
+      this._drainAnalysis()
+      if (this.backlog.length >= FRAME_BYTES) {
+        await new Promise<void>((resolve) => setImmediate(resolve))
+      }
+    }
+  }
+
+  private _drainAnalysis(): void {
+    let processed = 0
+    while (
+      this.backlog.length >= FRAME_BYTES &&
+      processed < MAX_SYNC_ANALYSIS_FRAMES
+    ) {
+      this._pushFrame(this.backlog.subarray(0, FRAME_BYTES))
+      this.backlog = this.backlog.subarray(FRAME_BYTES)
+      processed += 1
+    }
+    if (this.backlog.length === 0) this.backlog = Buffer.alloc(0)
+    if (this.backlog.length >= FRAME_BYTES) this._scheduleAnalysisDrain()
+  }
+
+  private _scheduleAnalysisDrain(): void {
+    if (this.analysisDrainScheduled) return
+    this.analysisDrainScheduled = true
+    setImmediate(() => {
+      this.analysisDrainScheduled = false
+      this._drainAnalysis()
+    })
   }
 
   /** Returns the latest musical estimate. */
   public getProfile(): MusicalProfile {
     if (
-      this.onsets.length >= 200 &&
+      this.onsets.length >= 150 &&
       (!this.estimate || this.framesSinceEstimate >= 50)
     ) {
       this.estimate = this._estimateTempo()
@@ -582,9 +639,10 @@ export class MusicalAnalyzer {
       (bestScore - Math.max(correlationMean, secondScore)) /
         Math.max(bestScore, 1e-6)
     )
+    const sampleRatio = Math.min(1, this.onsets.length / 200)
     const confidence = Math.max(
       0,
-      Math.min(1, bestScore * 0.72 + separation * 0.28)
+      Math.min(1, (bestScore * 0.72 + separation * 0.28) * sampleRatio)
     )
     const phase = this._estimatePhase(onset, refinedLag)
     const downbeatPhase = this._estimateDownbeatPhase(lowOnset, refinedLag)
@@ -847,11 +905,15 @@ export function detectIntroBoundary(
   let foundFirstBeat = false
   let foundVocalEntry = false
   let consecutiveVocalFrames = 0
+  let windowsScanned = 0
+  let vocalWindows = 0
+  let maxConsecutiveVocal = 0
 
   for (let ms = 0; ms < scanMs; ms += 25) {
     const rawOffset = Math.floor(ms * bytesPerMs)
     const offset = rawOffset - (rawOffset % bytesPerSample)
     const energy = calculatePcmRms(pcm, offset, windowBytes)
+    windowsScanned += 1
 
     if (!foundFirstElement && energy >= 0.004) {
       silenceEndMs = ms
@@ -870,6 +932,10 @@ export function detectIntroBoundary(
     const isVocalEnergyCandidate = energy >= 0.018 && energy <= 0.3
     if (isVocalEnergyCandidate && foundFirstElement) {
       consecutiveVocalFrames++
+      vocalWindows++
+      if (consecutiveVocalFrames > maxConsecutiveVocal) {
+        maxConsecutiveVocal = consecutiveVocalFrames
+      }
       if (consecutiveVocalFrames >= 10 && !foundVocalEntry) {
         vocalEntryMs = Math.max(firstElementMs, ms - 225)
         foundVocalEntry = true
@@ -895,6 +961,19 @@ export function detectIntroBoundary(
     energyPeakMs - silenceEndMs > 500 &&
     energyPeakMs > firstBeatMs
 
+  const vocalCoverage = vocalWindows / Math.max(1, windowsScanned)
+  const vocalPersistence = Math.min(1, maxConsecutiveVocal / 40)
+  const scanCompleteness = Math.min(1, scanMs / 10000)
+  const vocalConfidence = foundVocalEntry
+    ? Math.min(
+        1,
+        0.3 + 0.5 * vocalPersistence + 0.2 * Math.min(1, vocalCoverage * 3)
+      )
+    : Math.max(
+        0.05,
+        Math.min(0.45, (0.45 - vocalCoverage * 2) * scanCompleteness)
+      )
+
   return {
     silenceEndMs,
     firstElementMs: foundFirstElement ? firstElementMs : 0,
@@ -906,8 +985,8 @@ export function detectIntroBoundary(
     vocalEvidence: {
       detected: foundVocalEntry,
       entryMs: foundVocalEntry ? vocalEntryMs : 0,
-      confidence: foundVocalEntry ? 0.75 : 0.2,
-      persistenceMs: consecutiveVocalFrames * 25
+      confidence: Math.round(vocalConfidence * 100) / 100,
+      persistenceMs: maxConsecutiveVocal * 25
     }
   }
 }
@@ -929,19 +1008,19 @@ export function inspectTrackIntroQuick(
  * decay start, natural outro point, and overall energy profile type.
  * Result is cached automatically in {@link TransitionProfileCache}.
  */
-export function inspectTrackOutroQuick(
+export async function inspectTrackOutroQuick(
   pcm: Buffer,
   sampleRate: number,
   trackId: string,
   windowStartMs: number,
   _trackLengthMs: number
-): TrackPreAnalysisProfile {
+): Promise<TrackPreAnalysisProfile> {
   const bytesPerSample = CHANNELS * BYTES_PER_SAMPLE
   const bytesPerMs = (sampleRate * bytesPerSample) / 1000
   const windowEndMs = windowStartMs + pcm.length / bytesPerMs
 
   const analyzer = new MusicalAnalyzer(sampleRate)
-  analyzer.pushPcm(pcm)
+  await analyzer.pushPcmAsync(pcm)
   const profile = analyzer.getProfile()
 
   const scanWindowBytes = Math.max(
@@ -1866,6 +1945,10 @@ export function evaluateMusicalRelationship(
     outgoingTransitionConf >= 0.4
 
   const hasStructuredIntro = introProfile?.structuredIntro ?? false
+  const introConfidence = introProfile
+    ? (introProfile.vocalEvidence?.confidence ??
+      (introProfile.structuredIntro ? 0.6 : 0.3))
+    : 0
 
   let independentSignals = 0
   let strongSignals = 0
@@ -1894,8 +1977,8 @@ export function evaluateMusicalRelationship(
   const decisionReliability =
     harmonic.confidence * 0.3 +
     Math.min(outgoingConf, incomingConf) * 0.4 +
-    (outroProfile ? 0.15 : 0.05) +
-    (introProfile ? 0.15 : 0.05)
+    (outroProfile ? 0.05 + outroProfile.analysisConfidence * 0.1 : 0.05) +
+    (introProfile ? 0.05 + introConfidence * 0.1 : 0.05)
 
   const isTempoClash = tempo !== null && tempo.difference > 0.22
   const isHarmonicClash = harmonic.relation === 'harmonic-clash'
@@ -1941,7 +2024,9 @@ export function evaluateMusicalRelationship(
       ? 'strong'
       : decisionReliability >= 0.22
         ? 'likely'
-        : 'uncertain'
+        : decisionReliability >= 0.12
+          ? 'uncertain'
+          : 'low'
 
   const effects: TransitionEffectsPlan = {
     bassSwap:
@@ -1957,7 +2042,7 @@ export function evaluateMusicalRelationship(
         archetype === 'vocal-handoff') &&
       incoming.bands.low > 0.035,
     echoTail:
-      archetype === 'filter-sweep-dip' ||
+      (archetype === 'filter-sweep-dip' && !isTempoClash) ||
       archetype === 'natural-decay' ||
       archetype === 'silence-breath' ||
       archetype === 'washout-delay' ||

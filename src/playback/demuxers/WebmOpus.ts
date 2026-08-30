@@ -28,8 +28,11 @@ const TAGS: Readonly<Record<string, boolean>> = Object.freeze({
   18538067: true,
   '1f43b675': true,
   '1654ae6b': true,
+  '1549ae6b': true,
   '1c53bb6b': false,
   '1254c367': false,
+  '2ad7b1': false,
+  '4489': false,
   ae: true,
   d7: false,
   83: false,
@@ -39,6 +42,8 @@ const TAGS: Readonly<Record<string, boolean>> = Object.freeze({
   a0: true,
   a1: false
 })
+
+const DEFAULT_TIMECODE_SCALE_NS = 1_000_000
 
 const OPUS_HEAD = Buffer.from([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64])
 const MAX_TAG_SIZE = 10 * 1024 * 1024
@@ -79,6 +84,15 @@ const webmOpusProfiler: WebmOpusProfilerStats = {
 export const getWebmOpusProfilerStats = (): WebmOpusProfilerStats => ({
   ...webmOpusProfiler
 })
+
+const readEbmlUint = (data: Buffer): bigint => {
+  let value = 0n
+  const limit = Math.min(data.length, 8)
+  for (let i = 0; i < limit; i++) {
+    value = (value << 8n) | BigInt(data[i] ?? 0)
+  }
+  return value
+}
 
 type VintLengthResult = number | typeof TOO_SHORT | typeof INVALID_VINT
 type VintResult = bigint | typeof TOO_SHORT
@@ -163,6 +177,10 @@ abstract class WebmBaseDemuxer extends Transform {
   protected currentTrack: WebmTrackInfo | null
   protected pendingTrack: WebmTrackInfo
   protected ebmlFound: boolean
+  protected timecodeScaleNs: number
+  protected durationUnits: number | null
+  protected firstClusterUnits: bigint | null
+  protected timingEmitted: boolean
 
   /**
    * Creates a new WebM demuxer instance.
@@ -181,6 +199,10 @@ abstract class WebmBaseDemuxer extends Transform {
     this.currentTrack = null
     this.pendingTrack = {}
     this.ebmlFound = false
+    this.timecodeScaleNs = DEFAULT_TIMECODE_SCALE_NS
+    this.durationUnits = null
+    this.firstClusterUnits = null
+    this.timingEmitted = false
     webmOpusProfiler.created++
     webmOpusProfiler.active++
   }
@@ -388,6 +410,23 @@ abstract class WebmBaseDemuxer extends Transform {
         this.currentTrack = this.pendingTrack
     }
 
+    if (tag === '2ad7b1' && data.length > 0 && data.length <= 8) {
+      const scale = Number(readEbmlUint(data))
+      if (Number.isFinite(scale) && scale > 0) {
+        this.timecodeScaleNs = scale
+      }
+    } else if (tag === '4489' && (data.length === 4 || data.length === 8)) {
+      const raw = data.length === 8 ? data.readDoubleBE(0) : data.readFloatBE(0)
+      if (Number.isFinite(raw) && raw > 0) {
+        this.durationUnits = raw
+      }
+    } else if (tag === 'e7' && data.length > 0 && data.length <= 8) {
+      if (this.firstClusterUnits === null) {
+        this.firstClusterUnits = readEbmlUint(data)
+        this._emitTiming()
+      }
+    }
+
     if (tag === '63a2') {
       try {
         this._checkHead(data)
@@ -411,6 +450,19 @@ abstract class WebmBaseDemuxer extends Transform {
     }
 
     return { offset: currentOffset + numDataLen }
+  }
+
+  private _emitTiming(): void {
+    if (this.timingEmitted) return
+    this.timingEmitted = true
+    const scaleMs = this.timecodeScaleNs / 1_000_000
+    const firstClusterMs =
+      this.firstClusterUnits !== null
+        ? Number(this.firstClusterUnits) * scaleMs
+        : null
+    const durationMs =
+      this.durationUnits !== null ? this.durationUnits * scaleMs : null
+    this.emit('timing', { firstClusterMs, durationMs })
   }
 
   /**
@@ -450,6 +502,10 @@ abstract class WebmBaseDemuxer extends Transform {
     this.currentTrack = null
     this.ebmlFound = false
     this.skipUntil = null
+    this.timecodeScaleNs = DEFAULT_TIMECODE_SCALE_NS
+    this.durationUnits = null
+    this.firstClusterUnits = null
+    this.timingEmitted = false
   }
 }
 

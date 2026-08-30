@@ -59,6 +59,8 @@ const PRIORITY_ORDER: Record<AnalysisJobPriority, number> = {
   PASSIVE_REFINEMENT: 4
 }
 
+const DECODE_YIELD_BYTES = 64 * 1024
+
 export interface AnalysisRequestOptions {
   track: PlayerTrack
   urlData: TrackUrlResult & { protocol?: string; format?: TrackFormat }
@@ -112,8 +114,12 @@ export class AutoMixRegistry {
 
   private lastTickTime = performance.now()
   private currentEventLoopLagMs = 0
-  private maxEventLoopLagMs = 0
+  private jobEventLoopLagMaxMs = 0
   private lagMonitorInterval: NodeJS.Timeout | null = null
+  private lastStallWarnAt = 0
+  private stallWindowCount = 0
+  private stallWindowMaxMs = 0
+  private lastStallSummaryAt = 0
 
   private constructor() {
     this._startLagMonitor()
@@ -134,13 +140,42 @@ export class AutoMixRegistry {
       const delta = now - this.lastTickTime - 200
       this.lastTickTime = now
       this.currentEventLoopLagMs = Math.max(0, delta)
-      if (this.currentEventLoopLagMs > this.maxEventLoopLagMs) {
-        this.maxEventLoopLagMs = this.currentEventLoopLagMs
+      if (
+        this.activeWorkers > 0 &&
+        this.currentEventLoopLagMs > this.jobEventLoopLagMaxMs
+      ) {
+        this.jobEventLoopLagMaxMs = this.currentEventLoopLagMs
       }
       if (this.currentEventLoopLagMs > 35) {
         this.maxConcurrent = 1
       } else if (this.currentEventLoopLagMs < 15) {
         this.maxConcurrent = 2
+      }
+      if (this.currentEventLoopLagMs > 25) {
+        this.stallWindowCount += 1
+        if (this.currentEventLoopLagMs > this.stallWindowMaxMs) {
+          this.stallWindowMaxMs = this.currentEventLoopLagMs
+        }
+      }
+      if (this.stallWindowCount > 0 && now - this.lastStallSummaryAt > 60000) {
+        this.lastStallSummaryAt = now
+        logger(
+          'warn',
+          'AutoMix',
+          `[AutoMix] ${this.stallWindowCount} event loop stalls (max ${Math.round(this.stallWindowMaxMs)}ms) in the last 60s — micro-stutters possible even without individual stall warnings`
+        )
+        this.stallWindowCount = 0
+        this.stallWindowMaxMs = 0
+      }
+      if (this.currentEventLoopLagMs > 60) {
+        if (now - this.lastStallWarnAt > 60000) {
+          this.lastStallWarnAt = now
+          logger(
+            'warn',
+            'AutoMix',
+            `[AutoMix] Event loop stalled ${Math.round(this.currentEventLoopLagMs)}ms — audible playback glitches possible`
+          )
+        }
       }
     }, 200)
     this.lagMonitorInterval.unref?.()
@@ -337,6 +372,9 @@ export class AutoMixRegistry {
     const job = this.queue.shift()
     if (!job) return
 
+    if (this.activeWorkers === 0) {
+      this.jobEventLoopLagMaxMs = this.currentEventLoopLagMs
+    }
     this.activeWorkers++
     const abortController = new AbortController()
 
@@ -416,6 +454,9 @@ export class AutoMixRegistry {
       const resultPromise = new Promise<TrackPreAnalysisProfile | null>(
         (resolve) => {
           let finished = false
+          let ending = false
+          let pacing = false
+          let bytesSinceYield = 0
 
           const finish = (profile: TrackPreAnalysisProfile | null) => {
             if (finished) return
@@ -439,6 +480,17 @@ export class AutoMixRegistry {
             bytesRead += chunk.length
             analyzer.pushPcm(chunk)
 
+            bytesSinceYield += chunk.length
+            if (bytesSinceYield >= DECODE_YIELD_BYTES && !pacing) {
+              bytesSinceYield = 0
+              pacing = true
+              stream.pause()
+              setImmediate(() => {
+                pacing = false
+                if (!finished) stream.resume()
+              })
+            }
+
             if (
               bytesRead >= minStopBytes &&
               bytesRead % (48000 * 4) < chunk.length
@@ -459,8 +511,11 @@ export class AutoMixRegistry {
             }
           }
 
-          const onEnd = () => {
-            if (finished) return
+          const onEnd = async () => {
+            if (finished || ending) return
+            ending = true
+            stream.removeListener('data', onData)
+            if (!stream.destroyed) stream.pause()
             analyzeStart = performance.now()
             if (chunks.length === 0) {
               finish(null)
@@ -470,15 +525,18 @@ export class AutoMixRegistry {
             const pcm = Buffer.concat(chunks)
             chunks.length = 0
 
-            const updatedProfile = inspectTrackOutroQuick(
-              pcm,
-              48000,
-              trackId,
-              windowStartMs,
-              trackLength
-            )
-
-            finish(updatedProfile)
+            try {
+              const updatedProfile = await inspectTrackOutroQuick(
+                pcm,
+                48000,
+                trackId,
+                windowStartMs,
+                trackLength
+              )
+              finish(updatedProfile)
+            } catch {
+              finish(null)
+            }
           }
 
           const onError = () => {
@@ -532,7 +590,7 @@ export class AutoMixRegistry {
           elapsedMs: Math.round(totalMs),
           playbackContinued: true,
           audioUnderrun: false,
-          eventLoopLagMaxMs: Math.round(this.maxEventLoopLagMs * 10) / 10,
+          eventLoopLagMaxMs: Math.round(this.jobEventLoopLagMaxMs * 10) / 10,
           stoppedEarly,
           cancelled: false
         })

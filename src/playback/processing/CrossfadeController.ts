@@ -45,8 +45,11 @@ const BYTES_PER_FRAME = CHANNELS * 2
 const HALF_PI = Math.PI / 2
 const MAX_STARVATION_MS = 5000
 const MUSICAL_ANALYSIS_MS = 2000
+const TRIGGER_SAFETY_MS = 1200
+const BUFFER_HOLD_HEADROOM_MS = 750
 const _MAX_ENTRY_SCAN_MS = 300
 const EMPTY_BUFFER = Buffer.alloc(0)
+const SILENT_FRAME = Buffer.alloc(FRAME_SIZE)
 const BASS_CROSSOVER_HZ = 200
 const BASS_FILTER_ALPHA = Math.exp(
   (-2 * Math.PI * BASS_CROSSOVER_HZ) / SAMPLE_RATE
@@ -59,6 +62,12 @@ const MID_FILTER_ALPHA = Math.exp(
   (-2 * Math.PI * MID_CROSSOVER_HZ) / SAMPLE_RATE
 )
 const MID_DUCK_DB = -6
+const DECODE_PACING_BYTES = 64 * 1024
+const MAIN_EOF_CATCHUP_MS = 240
+const MAIN_EOF_CATCHUP_FRAMES = Math.round(
+  (MAIN_EOF_CATCHUP_MS / 1000) * SAMPLE_RATE
+)
+const CLIFF_GATE_DEFAULT_REMAINING_MS = 14000
 
 interface BufferedPcmStream {
   stream: Readable
@@ -69,12 +78,14 @@ interface BufferedPcmStream {
   pending: Buffer | null
   ended: boolean
   paused: boolean
+  recentBytes: number
+  pacing: boolean
   maxBytes: number
   resumeBytes: number
   listeners: {
     data: (chunk: Buffer) => void
     end: () => void
-    error: () => void
+    error: (err?: Error | null) => void
   }
   onComplete: (consumedMs: number) => void
   analyzer: MusicalAnalyzer
@@ -115,6 +126,8 @@ interface CrossfadeRuntime {
   durationFrames: number
   elapsedFrames: number
   incomingFrames: number
+  incomingStarvedFrames: number
+  mainEnded: boolean
   curve: FadeCurve
   strategy: TransitionStrategy
   bassSwap: boolean
@@ -166,6 +179,9 @@ interface ArmedCrossfade {
   maximumWaitFrames: number
   maxBeatWaitFrames: number
   availableFrames: number
+  cliffGateFrames: number | null
+  cliffGateHeld: boolean
+  bufferHoldLogged: boolean
   midDuckDb: number
   harmonicRelation?: string
 }
@@ -230,11 +246,16 @@ export class CrossfadeController extends Transform {
   private pumpPaused = false
   private waitingForRead = false
   private starvationStartedAt = 0
+  private bridgeStarvedMs = 0
+  private bridgeStarvedWarned = false
+  private mainStash: Buffer | null = null
+  private mainStallCallback: TransformCallback | null = null
   private destroyedController = false
   private bridgeLifecycleActive = false
 
   private activePlan: TransitionPlan | null = null
   private planFrozen = false
+  private lastPrepareOptions: CrossfadePrepareOptions | null = null
   private reclassificationCount = 0
   private transitionId = ''
   private archetypeHistory: TransitionArchetype[] = []
@@ -266,6 +287,7 @@ export class CrossfadeController extends Transform {
       Math.round(options.bufferMs ?? durationMs)
     )
 
+    this.lastPrepareOptions = { durationMs, minBufferMs, bufferMs }
     this.defaultDurationMs = durationMs
     this.minBufferBytes = this._alignBytes(minBufferMs * this.bytesPerMs)
     this.analysisReadyBytes = this._alignBytes(
@@ -277,6 +299,67 @@ export class CrossfadeController extends Transform {
       onComplete
     )
     stream.resume()
+    return true
+  }
+
+  public detachNextStream(): {
+    target: unknown
+    options: CrossfadePrepareOptions
+  } | null {
+    if (this.destroyedController || !this.next || this.transition) return null
+
+    this.armed = null
+    this.activePlan = null
+    this.planFrozen = false
+    const target = this.next
+    this.next = null
+    this.defaultDurationMs = 0
+    this.minBufferBytes = 0
+    this.analysisReadyBytes = 0
+    const options = this.lastPrepareOptions
+    this.lastPrepareOptions = null
+    return options ? { target, options } : null
+  }
+
+  public adoptNextStream(
+    target: unknown,
+    options: CrossfadePrepareOptions,
+    onComplete: (consumedMs: number) => void
+  ): boolean {
+    if (
+      this.destroyedController ||
+      this.next ||
+      this.transition ||
+      this.armed ||
+      !target
+    ) {
+      return false
+    }
+
+    const adopted = target as BufferedPcmStream
+    if (!adopted.stream || !Array.isArray(adopted.chunks)) return false
+
+    const durationMs = Math.max(1, Math.round(options.durationMs))
+    const minBufferMs = Math.max(
+      FRAME_DURATION_MS,
+      Math.min(2000, Math.round(options.minBufferMs ?? 2000))
+    )
+    const bufferMs = Math.max(
+      minBufferMs,
+      Math.round(options.bufferMs ?? durationMs)
+    )
+
+    adopted.onComplete = onComplete
+    this.lastPrepareOptions = { durationMs, minBufferMs, bufferMs }
+    this.defaultDurationMs = durationMs
+    this.minBufferBytes = this._alignBytes(minBufferMs * this.bytesPerMs)
+    this.analysisReadyBytes = this._alignBytes(
+      Math.min(bufferMs, MUSICAL_ANALYSIS_MS) * this.bytesPerMs
+    )
+    this.next = adopted
+    if (!adopted.paused && !adopted.pacing && !adopted.stream.destroyed) {
+      adopted.stream.resume()
+    }
     return true
   }
 
@@ -296,7 +379,8 @@ export class CrossfadeController extends Transform {
   public startCrossfade(
     durationMs?: number,
     curve?: string,
-    availableMs?: number
+    availableMs?: number,
+    outroRemainingMs?: number
   ): boolean {
     if (!this.next || this.transition || this.armed || !this.isReady()) {
       return false
@@ -359,7 +443,7 @@ export class CrossfadeController extends Transform {
         : mainProfile.bpm
     const beatMs = effectiveMainBpm ? 60000 / effectiveMainBpm : 500
 
-    const safetyMarginMs = 4000
+    const safetyMarginMs = TRIGGER_SAFETY_MS
     const selectionMs = Math.max(
       0,
       availableDurationMs - resolvedDuration - safetyMarginMs
@@ -370,6 +454,27 @@ export class CrossfadeController extends Transform {
       Math.max(minimumWaitMs, selectionMs * 0.55)
     )
     const maximumWaitMs = Math.max(preferredWaitMs, selectionMs)
+
+    const hasAnalyzedOutroTiming =
+      outroRemainingMs !== undefined && Number.isFinite(outroRemainingMs)
+    const cliffGateRemainingMs = hasAnalyzedOutroTiming
+      ? Math.max(0, Math.round(outroRemainingMs)) + 2000
+      : CLIFF_GATE_DEFAULT_REMAINING_MS
+    const cliffGateSourceMs = availableMs ?? requestedDurationMs
+    const cliffGateFrames = Math.max(
+      0,
+      Math.round(
+        ((cliffGateSourceMs - cliffGateRemainingMs) / 1000) * SAMPLE_RATE
+      )
+    )
+
+    if (!hasAnalyzedOutroTiming) {
+      logger(
+        'info',
+        'AutoMix',
+        `[AutoMix][${transitionId}][CliffGateDefault] no analyzed outro timing available — holding energy-cliff triggers until ${CLIFF_GATE_DEFAULT_REMAINING_MS}ms remain`
+      )
+    }
 
     this.armed = {
       plan,
@@ -407,6 +512,9 @@ export class CrossfadeController extends Transform {
           ? Math.round((Math.min(1200, beatMs * 1.25) / 1000) * SAMPLE_RATE)
           : 0,
       availableFrames: Math.round((availableDurationMs / 1000) * SAMPLE_RATE),
+      cliffGateFrames,
+      cliffGateHeld: false,
+      bufferHoldLogged: false,
       midDuckDb: plan.effects.midDuckDb,
       harmonicRelation: harmonic.relation
     }
@@ -521,6 +629,22 @@ export class CrossfadeController extends Transform {
     if (!paused && this.flushCallback) this._schedulePump(0)
   }
 
+  public resetCrossfadePlan(): boolean {
+    if (this.destroyedController) return false
+    if (!this.armed || this.transition) return false
+    const transitionId = this.transitionId
+    this.armed = null
+    this.activePlan = null
+    this.planFrozen = false
+    this.transitionId = ''
+    logger(
+      'info',
+      'AutoMix',
+      `[AutoMix][${transitionId || 'unknown'}][PLAN_RESET] armed plan discarded (seek/reposition); next stream preserved`
+    )
+    return true
+  }
+
   /** Detaches and discards the prepared next track. */
   public clearNext(): void {
     this.transition = null
@@ -534,7 +658,7 @@ export class CrossfadeController extends Transform {
 
   override _read(size: number): void {
     this.waitingForRead = false
-    if (this.flushCallback) this._schedulePump(0)
+    if (this.flushCallback || this.mainStash) this._schedulePump(0)
     super._read(size)
   }
 
@@ -560,7 +684,10 @@ export class CrossfadeController extends Transform {
       }
 
       if (this.transition && this.next) {
-        this._pushTransitionFrame(frame)
+        if (!this._pushTransitionFrame(frame)) {
+          this._stashMainFrames(data.subarray(offset), callback)
+          return
+        }
       } else if (this.bridge) {
         this._pushBridgeBytes(frame.length)
       } else {
@@ -568,6 +695,17 @@ export class CrossfadeController extends Transform {
       }
     }
     callback()
+  }
+
+  private _stashMainFrames(
+    remainder: Buffer,
+    callback: TransformCallback
+  ): void {
+    this.mainStash = this.mainStash
+      ? Buffer.concat([this.mainStash, remainder])
+      : Buffer.from(remainder)
+    this.mainStallCallback = callback
+    this.waitingForRead = true
   }
 
   override _flush(callback: TransformCallback): void {
@@ -596,7 +734,21 @@ export class CrossfadeController extends Transform {
     }
 
     if (!this.bridge && this.transition && this.next) {
-      this._promoteNext(this.transition)
+      const remainingFrames =
+        this.transition.durationFrames - this.transition.elapsedFrames
+      if (remainingFrames > MAIN_EOF_CATCHUP_FRAMES) {
+        const earlyMs = Math.round((remainingFrames / SAMPLE_RATE) * 1000)
+        this.transition.mainEnded = true
+        this.transition.durationFrames =
+          this.transition.elapsedFrames + MAIN_EOF_CATCHUP_FRAMES
+        logger(
+          'warn',
+          'AutoMix',
+          `[AutoMix][${this.transitionId}][FadeCatchUp] outgoing audio ended ${earlyMs}ms before the planned fade — fast-forwarding the fade over ${MAIN_EOF_CATCHUP_MS}ms (stream shorter than metadata length)`
+        )
+      } else {
+        this._promoteNext(this.transition)
+      }
     }
 
     if (!this.bridge && !this.transition && !this.next) {
@@ -623,6 +775,8 @@ export class CrossfadeController extends Transform {
     this.transition = null
     this.armed = null
     this.mainPending = null
+    this.mainStash = null
+    this.mainStallCallback = null
     this.removeAllListeners()
     callback(error)
   }
@@ -641,6 +795,8 @@ export class CrossfadeController extends Transform {
       pending: null,
       ended: false,
       paused: false,
+      recentBytes: 0,
+      pacing: false,
       maxBytes: Math.max(FRAME_SIZE, maxBytes),
       resumeBytes: Math.max(FRAME_SIZE, Math.floor(maxBytes * 0.5)),
       listeners: {
@@ -660,7 +816,14 @@ export class CrossfadeController extends Transform {
       target.ended = true
       if (this.flushCallback) this._schedulePump(0)
     }
-    target.listeners.error = target.listeners.end
+    target.listeners.error = (err?: Error | null) => {
+      logger(
+        'warn',
+        'AutoMix',
+        `[AutoMix] Preload source stream failed: ${err?.message ?? 'unknown error'} — buffered audio will end early`
+      )
+      target.listeners.end()
+    }
 
     stream.on('data', target.listeners.data)
     stream.once('end', target.listeners.end)
@@ -690,6 +853,18 @@ export class CrossfadeController extends Transform {
       target.chunks.push(aligned)
       target.length += alignedLength
       target.analyzer.pushPcm(aligned)
+      target.recentBytes += alignedLength
+      if (target.recentBytes >= DECODE_PACING_BYTES && !target.pacing) {
+        target.recentBytes = 0
+        target.pacing = true
+        target.stream.pause()
+        setImmediate(() => {
+          target.pacing = false
+          if (!target.ended && !target.paused && !target.stream.destroyed) {
+            target.stream.resume()
+          }
+        })
+      }
     }
 
     if (target.length >= target.maxBytes && !target.paused) {
@@ -789,6 +964,8 @@ export class CrossfadeController extends Transform {
       const padded = Buffer.alloc(main.length)
       paddedIncoming?.copy(padded)
       paddedIncoming = padded
+      transition.incomingStarvedFrames +=
+        (main.length - (incoming?.length ?? 0)) / BYTES_PER_FRAME
     }
     transition.incomingFrames += main.length / BYTES_PER_FRAME
 
@@ -809,6 +986,15 @@ export class CrossfadeController extends Transform {
     }
     const padded = Buffer.alloc(size)
     output?.copy(padded)
+    this.bridgeStarvedMs += (size - (output?.length ?? 0)) / this.bytesPerMs
+    if (!this.bridgeStarvedWarned && this.bridgeStarvedMs >= 60) {
+      this.bridgeStarvedWarned = true
+      logger(
+        'warn',
+        'AutoMix',
+        `[AutoMix] Promoted track buffer starved: padded ${Math.round(this.bridgeStarvedMs)}ms of silence so far (decode/network slower than realtime — audible stutter likely)`
+      )
+    }
     this.push(padded)
   }
 
@@ -1179,13 +1365,24 @@ export class CrossfadeController extends Transform {
     this.analysisReadyBytes = 0
     this._resumeTarget(promoted)
     this._startBridgeLifecycle()
+    this.bridgeStarvedMs = 0
+    this.bridgeStarvedWarned = false
     const consumedMs = (runtime.incomingFrames / SAMPLE_RATE) * 1000
+    const starvedMs = (runtime.incomingStarvedFrames / SAMPLE_RATE) * 1000
+    if (runtime.incomingStarvedFrames > 0) {
+      logger(
+        'warn',
+        'AutoMix',
+        `[AutoMix][${transitionId}][IncomingStarved] incoming preload starved for ${Math.round(starvedMs)}ms during the transition (decode/network slower than realtime — audible gaps likely)`
+      )
+    }
     runtime.onComplete(consumedMs)
 
     logger('info', 'AutoMix', `[AutoMix][${transitionId}][PROMOTED]`, {
       transitionId,
       consumedMs: Math.round(consumedMs),
       incomingPushedFrames: runtime.incomingFrames,
+      incomingStarvedFrames: Math.round(runtime.incomingStarvedFrames),
       lifecycle: 'completed'
     })
 
@@ -1201,8 +1398,9 @@ export class CrossfadeController extends Transform {
       ),
       introHoldMs: plan?.introHoldMs ?? 0,
       consumedMs: Math.round(consumedMs),
+      starvedMs: Math.round(starvedMs),
       reclassificationCount: this.reclassificationCount,
-      audioUnderrun: false
+      audioUnderrun: runtime.incomingStarvedFrames > 0
     })
   }
 
@@ -1230,6 +1428,8 @@ export class CrossfadeController extends Transform {
     this.analysisReadyBytes = 0
     this._resumeTarget(promoted)
     this._startBridgeLifecycle()
+    this.bridgeStarvedMs = 0
+    this.bridgeStarvedWarned = false
 
     logger(
       'info',
@@ -1266,8 +1466,21 @@ export class CrossfadeController extends Transform {
       (profile.transitionConfidence >= 0.75 && profile.energy <= 0.06)
 
     if (isSilenceOrCliff) {
-      this._beginArmedTransition(false, 'outro-energy-cliff')
-      return
+      if (
+        armed.cliffGateFrames === null ||
+        armed.waitedFrames >= armed.cliffGateFrames
+      ) {
+        this._beginArmedTransition(false, 'outro-energy-cliff')
+        return
+      }
+      if (!armed.cliffGateHeld) {
+        armed.cliffGateHeld = true
+        logger(
+          'info',
+          'AutoMix',
+          `[AutoMix][${armed.transitionId}][CliffGateHeld] waiting for analyzed outro region (held at ${Math.round((armed.waitedFrames / SAMPLE_RATE) * 1000)}ms, gate opens at ${Math.round((armed.cliffGateFrames / SAMPLE_RATE) * 1000)}ms)`
+        )
+      }
     }
 
     if (armed.waitedFrames < armed.minimumWaitFrames) return
@@ -1418,6 +1631,7 @@ export class CrossfadeController extends Transform {
     const previousFingerprint = armed.plan.fingerprint
     this.reclassificationCount++
     armed.plan = newPlan
+    this.activePlan = newPlan
     armed.strategy = newPlan.archetype === 'filter-sweep-dip' ? 'dip' : 'mix'
     armed.bassSwap = newPlan.effects.bassSwap
     armed.echoTail = newPlan.effects.echoTail
@@ -1455,9 +1669,11 @@ export class CrossfadeController extends Transform {
 
     if (
       (stability >= 0.75 &&
-        newPlan.decisionReliability >= 0.25 &&
-        this.archetypeHistory.length >= 2) ||
-      (stability === 1.0 && this.archetypeHistory.length >= 2)
+        newPlan.decisionReliability >= 0.32 &&
+        this.archetypeHistory.length >= 3) ||
+      (stability === 1.0 &&
+        newPlan.decisionReliability >= 0.28 &&
+        this.archetypeHistory.length >= 3)
     ) {
       this.planFrozen = true
       logger(
@@ -1485,6 +1701,31 @@ export class CrossfadeController extends Transform {
     const next = this.next
     if (!armed || !next) return false
 
+    if (!force) {
+      const neededBufferBytes = this._alignBytes(
+        (armed.durationMs + BUFFER_HOLD_HEADROOM_MS) * this.bytesPerMs
+      )
+      const latestStartFrames =
+        armed.availableFrames -
+        Math.round(
+          ((armed.durationMs + TRIGGER_SAFETY_MS) / 1000) * SAMPLE_RATE
+        )
+      if (
+        next.length < neededBufferBytes &&
+        armed.waitedFrames < latestStartFrames
+      ) {
+        if (!armed.bufferHoldLogged) {
+          armed.bufferHoldLogged = true
+          logger(
+            'info',
+            'AutoMix',
+            `[AutoMix][${armed.transitionId}][BufferHold] holding trigger: incoming preload has ${Math.round(next.length / this.bytesPerMs)}ms buffered, needs ${Math.round(armed.durationMs + BUFFER_HOLD_HEADROOM_MS)}ms for a clean transition`
+          )
+        }
+        return false
+      }
+    }
+
     this.planFrozen = true
 
     const transitionId = armed.transitionId
@@ -1493,9 +1734,7 @@ export class CrossfadeController extends Transform {
     const nextProfile = next.analyzer.getProfile()
 
     const plannedEntryPointMs = plan.entryPointMs ?? 0
-    const rawSkipBytes = Math.floor(
-      (plannedEntryPointMs / 1000) * this.bytesPerMs
-    )
+    const rawSkipBytes = Math.floor(plannedEntryPointMs * this.bytesPerMs)
     const skipBytes = Math.min(
       next.length,
       rawSkipBytes - (rawSkipBytes % BYTES_PER_FRAME)
@@ -1530,6 +1769,8 @@ export class CrossfadeController extends Transform {
       durationFrames,
       elapsedFrames: 0,
       incomingFrames: skipBytes / BYTES_PER_FRAME,
+      incomingStarvedFrames: 0,
+      mainEnded: false,
       curve: armed.curve,
       strategy: armed.strategy,
       bassSwap: armed.bassSwap,
@@ -1642,9 +1883,9 @@ export class CrossfadeController extends Transform {
   private _schedulePump(delay: number): void {
     if (
       this.pumpTimer ||
-      !this.flushCallback ||
       this.destroyedController ||
-      this.waitingForRead
+      this.waitingForRead ||
+      (!this.flushCallback && !this.mainStash)
     ) {
       return
     }
@@ -1656,9 +1897,39 @@ export class CrossfadeController extends Transform {
   }
 
   private _pump(): void {
-    if (!this.flushCallback || this.destroyedController) return
+    if (this.destroyedController) return
+    if (!this.flushCallback && !this.mainStash) return
     if (this.pumpPaused) {
       this._schedulePump(FRAME_DURATION_MS)
+      return
+    }
+
+    if (this.mainStash) {
+      const stash = this.mainStash
+      const frameLength = Math.min(FRAME_SIZE, stash.length)
+      const frame = stash.subarray(0, frameLength)
+      this.mainStash =
+        stash.length > frameLength
+          ? Buffer.from(stash.subarray(frameLength))
+          : null
+      let accepted = true
+      if (this.transition && this.next) {
+        accepted = this._pushTransitionFrame(frame)
+      } else if (this.bridge) {
+        this._pushBridgeBytes(frame.length)
+      } else {
+        accepted = this.push(frame)
+      }
+      if (!this.mainStash && this.mainStallCallback) {
+        const stalled = this.mainStallCallback
+        this.mainStallCallback = null
+        stalled()
+      }
+      if (!accepted) {
+        this.waitingForRead = true
+        return
+      }
+      this._schedulePump(0)
       return
     }
 
@@ -1687,6 +1958,17 @@ export class CrossfadeController extends Transform {
     }
 
     if (this.transition && this.next) {
+      const transition = this.transition
+      if (transition.mainEnded) {
+        const accepted = this._pushTransitionFrame(SILENT_FRAME)
+        if (this.transition !== transition) this.starvationStartedAt = 0
+        if (!accepted) {
+          this.waitingForRead = true
+          return
+        }
+        this._schedulePump(0)
+        return
+      }
       const outgoing = this.bridge
         ? this._readTarget(this.bridge, FRAME_SIZE)
         : null

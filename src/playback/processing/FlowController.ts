@@ -7,6 +7,7 @@ import type {
   IVolumeTransformer,
   ScratchStyle
 } from '../../typings/playback/processing.types.ts'
+import { logger } from '../../utils.ts'
 
 const FRAME_SIZE = 3840
 const EMPTY_BUFFER = Buffer.alloc(0)
@@ -23,6 +24,7 @@ export class FlowController extends Transform {
   private readonly audioMixer: AudioMixer | null
   private pendingBuffer: Buffer | null
   private pendingLength: number
+  private layerMixWarned = false
 
   /**
    * Creates a new FlowController.
@@ -66,7 +68,16 @@ export class FlowController extends Transform {
       try {
         const layerChunks = this.audioMixer.readLayerChunks(output.length)
         output = this.audioMixer.mixBuffers(output, layerChunks)
-      } catch (_error) {}
+      } catch (error) {
+        if (!this.layerMixWarned) {
+          this.layerMixWarned = true
+          logger(
+            'warn',
+            'FlowController',
+            `Audio layer mixing failed: ${(error as Error).message}`
+          )
+        }
+      }
     }
 
     this.push(output)
@@ -218,7 +229,16 @@ export class FlowController extends Transform {
         try {
           const layerChunks = this.audioMixer.readLayerChunks(remaining.length)
           remaining = this.audioMixer.mixBuffers(remaining, layerChunks)
-        } catch (_error) {}
+        } catch (error) {
+          if (!this.layerMixWarned) {
+            this.layerMixWarned = true
+            logger(
+              'warn',
+              'FlowController',
+              `Audio layer mixing failed: ${(error as Error).message}`
+            )
+          }
+        }
       }
 
       const finalRemainder = remaining.length % 4
